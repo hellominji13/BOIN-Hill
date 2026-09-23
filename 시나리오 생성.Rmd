@@ -1,0 +1,1128 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Setting
+Parameter 설정 및 실제 시나리오 (랜덤) 생성
+
+# setting 1
+```{r}
+
+
+set.seed(42)
+
+#앞으로 코딩에 필요한 parameter (사전설정해야함) 미리 정의
+para <- list(
+  seed=123,
+  J = 5, 
+  cohort = 3,
+
+  DLT = 0.45, 
+  T_admissible = 0.5, #BOIN 에서 자동으로 + 0.05로 설정되어진다 
+  E_admissible = 0.2
+  )
+
+```
+
+```{r}
+f      <- function(x) 1/(1+exp(-x))
+qlogit <- function(p) log(p/(1-p))
+clip01 <- function(p, lo = 1e-8, hi = 1 - 1e-8) pmin(pmax(p, lo), hi)
+x_from_dose <- function(dose) log(dose/para$doses[length(para$doses)])
+sigma_fun <- function(x,s0,s1) sqrt(s0^2 + (x^2)*s1^2)
+
+
+beta_ab_from_mean_sd <- function(m, s, eps_k = 1e-3) {
+  m <- clip01(m)
+  ## 최대 분산 케이스: var ≈ m(1-m) (k → 0+)
+  if (is.null(s) || is.na(s) || is.infinite(s) || s >= sqrt(m*(1-m)) - 1e-10) {
+    k <- eps_k
+    a <- m * k; b <- (1-m) * k
+    return(c(a=a, b=b))
+  }
+  v <- s^2
+  ## v = m(1-m)/(k+1)  ->  k = m(1-m)/v - 1
+  k <- (m*(1-m))/v - 1
+  if (k <= 0) k <- eps_k
+  a <- m * k
+  b <- (1-m) * k
+  return(c(a=a, b=b))
+}
+
+
+fit_logistic_glm_approx <- function(doses, M_T, M_E, spec) {
+  x      <- x_from_dose(doses)
+  sigma  <- sigma_fun(x, spec$nsd, spec$nsd)
+  lambda <- sqrt(1 + (pi/8) * sigma^2)
+
+  ## ----- Toxicity: 기존과 동일 (평균만) -----
+  M_T_fit  <- pmax(M_T, 0.05)
+  mu_est_T <- qlogit(clip01(M_T_fit)) * lambda
+  mT <- lm(mu_est_T ~ x)
+  a0_T <- coef(mT)[1]; a1_T <- coef(mT)[2]   # 선형계수 (mu 파라미터)
+
+  ## ----- Efficacy: m0, m1도 함께 추정 -----
+  M_E_fit <- pmin(pmax(M_E, 0.005), 0.995)   # 극단값 방지
+  eps <- 1e-8
+  
+  # clip01 <- function(p, lo = 1e-8, hi = 1 - 1e-8) pmin(pmax(p, lo), hi)
+  # d0_E <- max(min(M_E), 0.01)
+  # d1_E <- max(min(max(M_E) - d0_E, 0.99 - d0_E), 0.01)
+  # # d0_E <- quantile(M_E, 0.1)
+  # # d1_E <- max(1e-6, quantile(M_E, 0.9) - d0_E)
+  # d0_E <- clip01(d0_E)
+  # d1_E <- min(clip01(d1_E), 1 - d0_E - eps)
+  # ## (3) 최종 b0, b1 추정 (닫힌형 OLS)
+  # pstar <- clip01((M_E_fit - d0_E) / d1_E)
+  # eta   <- lambda * qnorm(pstar)
+  # cf    <- coef(lm(eta ~ x))
+  # b0_E  <- unname(cf[1])
+  # b1_E  <- unname(cf[2])
+
+  
+  # 1) 초기값 (plateau → m0,m1)
+  m0_start <- max(min(M_E_fit-0.05), 1e-3)
+  m1_start <- max(min(max(M_E_fit+0.05) - m0_start, 0.999 - m0_start), 1e-3)
+  
+  # logit-approx를 이용해 선형계수 초기값
+  M_star   <- clip01((M_E_fit - m0_start) / m1_start)
+  mu_est_E <- qlogit(M_star) * lambda #z의 mean 값 E[g(z)] 로부터E[z] 계산
+  mE_lm    <- lm(mu_est_E ~ x)
+  b0_start <- unname(coef(mE_lm)[1])
+  b1_start <- unname(coef(mE_lm)[2])
+  
+  # 모델 함수
+  f_E <- function(x, m0, m1, b0, b1, lambda) {
+    m0 + m1 * f(b0 + b1 * x)
+  }
+  
+  # 2) 1차 시도: nlsLM 있으면 사용, 없으면 nls
+  # fitE <- NULL
+  # if (isTRUE(requireNamespace("minpack.lm", quietly = TRUE))) {
+  #   fitE <- tryCatch(
+  #     minpack.lm::nlsLM(
+  #       M_E_fit ~ f_E(x, m0, m1, b0, b1, lambda), #f is logistic function
+  #       start = list(m0 = m0_start, m1 = m1_start, b0 = b0_start, b1 = b1_start),
+  #       lower = c(1e-6, 1e-6, -Inf, -Inf),
+  #       upper = c(1 - 1e-6, 1 - 1e-6,  Inf,  Inf),
+  #       control = minpack.lm::nls.lm.control(maxiter = 500, ftol = 1e-10, ptol = 1e-10, gtol = 1e-10)
+  #     ),
+  #     error = function(e) NULL
+  #   )
+  # } 
+  # fitE <- tryCatch(
+  #   nls(
+  #     M_E_fit ~ f_E(x, m0, m1, b0, b1, lambda),
+  #     start   = list(m0 = m0_start, m1 = m1_start, b0 = b0_start, b1 = b1_start),
+  #     algorithm = "port",
+  #     lower = c(1e-6, 1e-6, -Inf, -Inf),
+  #     upper = c(1 - 1e-6, 1 - 1e-6,  Inf,  Inf),
+  #     control = list(warnOnly = TRUE, maxiter = 200)
+  #   ),
+  #   error = function(e) NULL
+  # )
+  # 
+  fitE <- NULL
+  # 3) 폴백: 재매개화로 unconstrained 최적화
+  if (is.null(fitE)) {
+    print("error 뜸")
+    # 재매개화: m0 = logistic(u), m1 = (1 - m0) * logistic(v)  => 자동 제약
+    # u0 <- qlogit(clip01(m0_start))
+    # v0 <- qlogit(clip01(m1_start / (1 - m0_start)))
+    p0 <- c(m0_start, m1_start, b0_start, b1_start)
+  
+    model_u <- function(par) {
+      m0 <- par[1]; m1 <- par[2]; b0 <- par[3]; b1 <- par[4]
+      # m0 <- plogis(u)
+      # m1 <- (1 - m0) * plogis(v)
+      f_E(x, m0, m1, b0, b1, lambda)
+    }
+    obj <- function(par) {
+      r <- M_E_fit - model_u(par)
+      sum(r * r)
+    }
+    opt <- optim(p0, obj, method = "BFGS",
+                 control = list(maxit = 1000, reltol = 1e-10))
+    d0_E  <- opt$par[1]; d1_E <- opt$par[2]; b0_E <- opt$par[3]; b1_E <- opt$par[4]
+    # d0_E <- plogis(u)
+    # d1_E <- (1 - d0_E) * plogis(v)
+  } else {
+    parsE <- coef(fitE)
+    d0_E  <- as.numeric(parsE["m0"])   # Beta mean m0
+    d1_E  <- as.numeric(parsE["m1"])   # Beta mean m1
+    b0_E  <- as.numeric(parsE["b0"])   # 선형계수
+    b1_E  <- as.numeric(parsE["b1"])
+  }
+  
+  # 4) 최종 안정화: mean만 clip, 그리고 m0 + m1 <= 1 - eps 보장
+  d0_E <- clip01(d0_E)
+  d1_E <- min(clip01(d1_E), 1 - d0_E - eps)
+  
+  list(
+    m0_T = a0_T, m1_T = a1_T,  # a0, a1 (Toxicity 선형계수)
+    m0_E = b0_E, m1_E = b1_E,  # b0, b1 (Efficacy 선형계수)
+    md0_E = d0_E, md1_E = d1_E   # d0, d1 (Efficacy Beta mean)
+  )
+  
+  
+}
+
+fit_logistic_glm_approx <- function(doses, M_T, M_E) {
+
+  ## ---------- 공통 준비 ----------
+  x <- x_from_dose(doses)
+  clip01 <- function(p, lo = 1e-8, hi = 1 - 1e-8) pmin(pmax(p, lo), hi)
+  f <- function(z) plogis(z)  # logistic
+  eps <- 1e-8
+
+  # seed 계산에만 lambda 사용 (허용된 근사)
+  sigma  <- sigma_fun(x, 1, 1)
+  lambda <- sqrt(1 + (pi/8) * sigma^2)
+
+  M_T_fit <- clip01(M_T, lo = eps, hi = 1 - eps)
+  M_E_fit <- clip01(M_E, lo = eps, hi = 1 - eps)
+
+  ## ---------- 1) TOX: (a0, a1)만 별도 최적화 ----------
+  # seed: logit(M_T) ~ a0 + a1*x  (lambda는 seed용)
+  zT <- qlogit(M_T_fit) * lambda
+  a_init <- coef(lm(zT ~ x)); if (any(is.na(a_init))) a_init <- c(0, 0)
+  a0_seed <- unname(a_init[1]); a1_seed <- unname(a_init[2])
+
+  pred_T <- function(a0, a1) f(a0 + a1 * x)
+  sse_T <- function(par) {
+    a0 <- par[1]; a1 <- par[2]
+    PT <- pred_T(a0, a1)
+    sum((M_T_fit - PT)^2)
+  }
+
+  fit_T <- optim(
+    par = c(a0_seed, a1_seed),
+    fn = sse_T,
+    method = "BFGS",
+    control = list(maxit = 5000, reltol = 1e-12, fnscale = 1)
+  )
+  if (!is.finite(fit_T$value)) stop("TOX optimization failed.")
+  a0_T <- fit_T$par[1]; a1_T <- fit_T$par[2]
+
+  ## ---------- 2) EFF: (b0, b1, u, v)만 별도 최적화 ----------
+  # 2-1) 초기 m0,m1 (min/max 기반), 그에 정합되는 b0,b1 seed 계산
+  m0_seed <- max(min(M_E_fit - 0.05), 1e-3)
+  m1_seed <- max(min(max(M_E_fit + 0.05) - m0_seed, 0.999 - m0_seed), 1e-3)
+
+  M_star  <- clip01((M_E_fit - m0_seed) / m1_seed)
+  zE <- qlogit(M_star) * lambda
+  b_init <- coef(lm(zE ~ x)); if (any(is.na(b_init))) b_init <- c(0, 0)
+  b0_seed <- unname(b_init[1]); b1_seed <- unname(b_init[2])
+
+  # 재매개화: m0 = logistic(u), m1 = (1 - m0) * logistic(v)
+  uv_from_m0m1 <- function(m0, m1) {
+    u <- qlogit(clip01(m0))
+    v <- qlogit(clip01(m1 / (1 - m0)))
+    c(u, v)
+  }
+  c_uv  <- uv_from_m0m1(m0_seed, m1_seed)
+  u_seed <- c_uv[1]; v_seed <- c_uv[2]
+
+  pred_E <- function(b0, b1, u, v) {
+    m0 <- plogis(u)
+    m1 <- (1 - m0) * plogis(v)
+    m0 + m1 * f(b0 + b1 * x)
+  }
+  sse_E <- function(par) {
+    b0 <- par[1]; b1 <- par[2]; u <- par[3]; v <- par[4]
+    PE <- pred_E(b0, b1, u, v)
+    sum((M_E_fit - PE)^2)
+  }
+
+  # 시작점 생성: u,v만 jitter; (해당 u,v → m0,m1)에 맞춰 b0,b1를 매번 seed로 재산정
+  make_jitter <- function(val, scale) val + rnorm(1, 0, scale)
+  set.seed(1776)
+
+  starts <- list(c(b0_seed, b1_seed, u_seed, v_seed))  # 기준 시작점
+
+  for (k in 1:300) {
+    u_k <- make_jitter(u_seed, 2)
+    v_k <- make_jitter(v_seed, 2)
+    m0_k <- plogis(u_k)
+    m1_k <- (1 - m0_k) * plogis(v_k)
+
+    # b0,b1를 m0_k, m1_k에 정합되게 재계산 (seed)
+    M_star_k <- clip01((M_E_fit - m0_k) / m1_k)
+    zE_k <- qlogit(M_star_k) * lambda
+    b_init_k <- coef(lm(zE_k ~ x)); if (any(is.na(b_init_k))) b_init_k <- c(0, 0)
+    b0_k <- unname(b_init_k[1]); b1_k <- unname(b_init_k[2])
+
+    starts[[k + 1]] <- c(b0_k, b1_k, u_k, v_k)
+  }
+
+  best_E <- NULL; best_val_E <- Inf
+  for (st in starts) {
+    fit <- tryCatch(
+      optim(
+        par     = st,
+        fn      = sse_E,
+        method  = "BFGS",
+        control = list(maxit = 6000, reltol = 1e-12, fnscale = 1)
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(fit) && is.finite(fit$value) && fit$value < best_val_E) {
+      best_E <- fit; best_val_E <- fit$value
+    }
+  }
+  if (is.null(best_E)) stop("EFF optimization failed.")
+
+  b0_E <- best_E$par[1]; b1_E <- best_E$par[2]
+  uhat <- best_E$par[3];  vhat <- best_E$par[4]
+
+  # 제약 해석값 복원 및 안정화
+  d0_E <- plogis(uhat)
+  d1_E <- (1 - d0_E) * plogis(vhat)
+  d0_E <- clip01(d0_E, lo = eps, hi = 1 - eps)
+  d1_E <- min(clip01(d1_E, lo = eps, hi = 1 - eps), 1 - d0_E - eps)
+
+  # 반환 (인터페이스 유지)
+  list(
+    m0_T = a0_T, m1_T = a1_T,   # Toxicity: a0, a1
+    m0_E = b0_E, m1_E = b1_E,   # Efficacy: b0, b1
+    md0_E = d0_E, md1_E = d1_E  # Efficacy: m0, m1
+  )
+}
+
+
+get_prior_specs <- function(prior_id) {
+  ## returns list(normal_sd=..., beta_sd0=..., beta_sd1=..., override_targets=FALSE/TRUE)
+  if (prior_id == 1) return(list(nsd=2, bsd0=0.2, bsd1=0.2, override=FALSE, label="Weakinf"))
+  if (prior_id == 2) return(list(nsd=4, bsd0=Inf,  bsd1=Inf,  override=FALSE, label="Noninf"))   # "max"
+  if (prior_id == 3) return(list(nsd=4, bsd0=Inf, bsd1=Inf, override=TRUE, label="Wronginf"))
+  stop("prior_id must be 1..3")
+}
+
+prepare_param_table_for_scenario <- function(scn, pars_list_by_prior,Ture_Val) {
+  ## helper: 한 행 생성
+  mkrow <- function(param, dist, TRUE_val,
+                    c1_me, c1_sd, c2_me, c2_sd, c3_me, c3_sd) {
+    df <- data.frame(
+      Scenario = scn,
+      Param    = param,
+      Dist     = dist,
+      TRUEE     = TRUE_val,   
+      C1_mean  = c1_me, C1_sd = c1_sd,
+      C2_mean  = c2_me, C2_sd = c2_sd,
+      C3_mean  = c3_me, C3_sd = c3_sd,
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+    names(df) <- c(
+      "Scenario","Param","Dist","TRUE",
+      "Cand1_mean(min,a)","Cand1_sd(max,b)",
+      "Cand2_mean(min,a)","Cand2_sd(max,b)",
+      "Cand3_mean(min,a)","Cand3_sd(max,b)"
+    )
+    df
+  }
+
+  ## --- Beta: δ0, δ1 (표에는 a,b를 Cand*_me, Cand*_sd로 기록) ---
+  d0_a <- sapply(pars_list_by_prior, function(z) z$a0)
+  d0_b <- sapply(pars_list_by_prior, function(z) z$b0)
+  d1_a <- sapply(pars_list_by_prior, function(z) z$a1)
+  d1_b <- sapply(pars_list_by_prior, function(z) z$b1)
+  d0_me <- sapply(pars_list_by_prior, function(z) z$d0_mean_hat)
+  d1_me <- sapply(pars_list_by_prior, function(z) z$d1_mean_hat)
+
+  row_d0 <- mkrow(
+    param="delta0", dist="Beta", TRUE_val=d0_me[1],
+    c1_me=d0_a[1], c1_sd=d0_b[1], c2_me=d0_a[2], c2_sd=d0_b[2],
+    c3_me=d0_a[3], c3_sd=d0_b[3]
+  )
+  row_d1 <- mkrow(
+    param="delta1", dist="Beta", TRUE_val=d1_me[1],
+    c1_me=d1_a[1], c1_sd=d1_b[1], c2_me=d1_a[2], c2_sd=d1_b[2],
+    c3_me=d1_a[3], c3_sd=d1_b[3]
+  )
+
+  ## --- Normal: b0,b1,a0,a1 (표에는 mean, sd 기록) ---
+  b0_me <- sapply(pars_list_by_prior, function(z) z$m0_E)
+  b1_me <- sapply(pars_list_by_prior, function(z) z$m1_E)
+  a0_me <- sapply(pars_list_by_prior, function(z) z$m0_T)
+  a1_me <- sapply(pars_list_by_prior, function(z) z$m1_T)
+  nsd   <- sapply(pars_list_by_prior, function(z) z$nsd)
+
+  row_b0 <- mkrow("b0","Normal", TRUE_val=Ture_Val[3],
+                  b0_me[1], nsd[1], b0_me[2], nsd[2], b0_me[3], nsd[3])
+  row_b1 <- mkrow("b1","Normal", TRUE_val=Ture_Val[4],
+                  b1_me[1], nsd[1], b1_me[2], nsd[2], b1_me[3], nsd[3])
+  row_a0 <- mkrow("a0","Normal", TRUE_val=Ture_Val[1],
+                  a0_me[1], nsd[1], a0_me[2], nsd[2], a0_me[3], nsd[3])
+  row_a1 <- mkrow("a1","Normal", TRUE_val=Ture_Val[2],
+                  a1_me[1], nsd[1], a1_me[2], nsd[2], a1_me[3], nsd[3])
+
+  out <-rbind(row_d0, row_d1, row_b0, row_b1, row_a0, row_a1)
+  rownames(out) <- NULL
+  print(out)
+  out
+}
+
+
+predictive_summary <- function(doses, pars_mean, nsd, delta_means, delta_sds, nsim=20000) {
+  x <- x_from_dose(doses)
+  ## Normal priors (linears)
+  m0T <- rnorm(nsim, mean=pars_mean["m0_T"], sd=nsd)
+  m1T <- rnorm(nsim, mean=pars_mean["m1_T"], sd=nsd)
+  m0E <- rnorm(nsim, mean=pars_mean["m0_E"], sd=nsd)
+  m1E <- rnorm(nsim, mean=pars_mean["m1_E"], sd=nsd)
+  ## Beta priors (d0, d1)
+  ab0 <- beta_ab_from_mean_sd(unname(delta_means["d0"]), unname(delta_sds["d0"]))
+  ab1 <- beta_ab_from_mean_sd(unname(delta_means["d1"]), unname(delta_sds["d1"]))
+  d0  <- rbeta(nsim,  unname(ab0["a"]), unname(ab0["b"]))
+  d1  <- rbeta(nsim,  unname(ab1["a"]),  unname(ab1["b"]))
+  ## 샘플 행렬(nsims x ndose)
+  J <- length(x)
+  T_samples <- matrix(NA_real_, nrow=nsim, ncol=J)
+  E_samples <- matrix(NA_real_, nrow=nsim, ncol=J)
+
+  for (j in seq_len(J)) {
+    zT <- m0T + m1T * x[j]
+    T_samples[, j] <- f(zT)
+
+    zE <- m0E + m1E * x[j]
+    E_samples[, j] <- clip01(d0 + d1 * f(zE))
+  }
+
+  ## 요약(mean,var)만 (파일 저장용)
+  summ <- cbind(
+    T_mean = colMeans(T_samples),
+    T_var  = apply(T_samples, 2, var),
+    E_mean = colMeans(E_samples),
+    E_var  = apply(E_samples, 2, var)
+  )
+
+  list(samples = list(T = T_samples, E = E_samples),
+       summary = summ,
+       ab = list(d0 = ab0, d1 = ab1))
+}
+
+
+```
+
+```{r}
+run_from_scenarios <- function(scenarios, nsim = 20000, out_csv = "파라미터_PKPD.csv"){
+  clip01 <- function(p, lo = 1e-8, hi = 1 - 1e-8) pmin(pmax(p, lo), hi)
+  f <- function(z) plogis(z)
+
+  plot_rows <- list()
+  all_rows  <- list()
+
+  for (scn in names(scenarios)) {
+    pi_T <- as.numeric(scenarios[[scn]]$pi_T)
+    pi_E <- as.numeric(scenarios[[scn]]$pi_E)
+    x    <- x_from_dose(para$doses)
+
+    ## (A) 시나리오별 1회: m0,m1 고정 추정 (spec 제외)
+    fit_pars_once <- fit_logistic_glm_approx(
+      doses = para$doses,
+      M_T   = pmax(pi_T, 0.05),
+      M_E   = pmax(pi_E, 0.05)
+    )
+
+    # 고정 m0,m1 및 선형계수
+    a0_T0 <- fit_pars_once$m0_T
+    a1_T0 <- fit_pars_once$m1_T
+    b0_E0 <- fit_pars_once$m0_E
+    b1_E0 <- fit_pars_once$m1_E
+    m0_fixed <- fit_pars_once$md0_E
+    m1_fixed <- fit_pars_once$md1_E
+
+    ## === (A-1) 그래프용 "mean-only (variance=0)" 라인 추가: PriorID=1 ===
+    # nsd = 0, delta 분산 = 0 가정 → 신뢰구간 없이 mean=lo=hi
+    T_mean0 <- f(a0_T0 + a1_T0 * x)
+    E_mean0 <- m0_fixed + m1_fixed * f(b0_E0 + b1_E0 * x)
+    T_mean0 <- clip01(T_mean0); E_mean0 <- clip01(E_mean0)
+
+    df_once <- tibble::tibble(
+      Scenario = scn,
+      PriorID  = 1L,
+      Prior    = "Mean-only (nsd=0, var=0)",
+      Dose     = para$doses,
+      T_target = pi_T,  E_target = pi_E,
+      T_mean   = T_mean0,
+      T_lo     = T_mean0, T_hi = T_mean0,
+      E_mean   = E_mean0,
+      E_lo     = E_mean0, E_hi = E_mean0
+    )
+    plot_rows[[length(plot_rows) + 1]] <- df_once
+    ## (B~G) prior별 처리
+    pars_list_by_prior <- vector("list", 3)
+
+    for (pid in 1:3) {
+      print(scn); print(pid)
+      spec <- get_prior_specs(pid)
+      sigma  <- sigma_fun(x, spec$nsd, spec$nsd)
+      lambda <- sqrt(1 + (pi/8) * sigma^2)
+
+      if (isTRUE(spec$override)) {
+        MT_fit <- seq(0.05, by = 0.02, length.out = length(para$doses))
+        ME_fit <- pmin(MT_fit + 0.3, 0.999)
+        m0_fixed<-0.1
+        m1_fixed<-0.6
+      } else {
+        MT_fit <- pmax(T_mean0, 0.05)
+        ME_fit <- pmax(E_mean0, 0.05)
+      }
+      
+      MT_fit <- clip01(MT_fit)
+      ME_fit <- clip01(ME_fit)
+
+      ## (D) probit 근사로 a0,a1 및 b0,b1 재추정 (m0,m1은 고정값 사용)
+      zT <- qlogit(MT_fit) * lambda
+      a_cf <- coef(lm(zT ~ x))
+      a0_hat <- unname(a_cf[1]); a1_hat <- unname(a_cf[2])
+
+      Pstar <- clip01((ME_fit - m0_fixed) / m1_fixed)
+      zE    <- qlogit(Pstar) * lambda
+      b_cf  <- coef(lm(zE ~ x))
+      b0_hat <- unname(b_cf[1]); b1_hat <- unname(b_cf[2])
+
+      ## (E) pars_mean 구성
+      pars_mean <- c(
+        "m0_T"  = a0_hat,
+        "m1_T"  = a1_hat,
+        "m0_E"  = b0_hat,
+        "m1_E"  = b1_hat,
+        "md0_E" = m0_fixed,
+        "md1_E" = m1_fixed
+      )
+
+      ## (F) Beta prior 파라미터
+      d_means <- c(d0 = as.numeric(pars_mean["md0_E"]),
+                   d1 = as.numeric(pars_mean["md1_E"]))
+      d_sds <- c(d0 = spec$bsd0, d1 = spec$bsd1)
+      ab0 <- beta_ab_from_mean_sd(unname(d_means["d0"]), unname(d_sds["d0"]))
+      ab1 <- beta_ab_from_mean_sd(unname(d_means["d1"]), unname(d_sds["d1"]))
+
+      pars_list_by_prior[[pid]] <- list(
+        a0   = unname(ab0["a"]), b0 = unname(ab0["b"]),
+        a1   = unname(ab1["a"]), b1 = unname(ab1["b"]),
+        m0_E = pars_mean["m0_E"], m1_E = pars_mean["m1_E"],
+        m0_T = pars_mean["m0_T"], m1_T = pars_mean["m1_T"],
+        nsd  = spec$nsd,
+        d0_mean_hat = unname(d_means["d0"]),
+        d1_mean_hat = unname(d_means["d1"])
+      )
+
+      ## (G) predictive summary
+      pred <- predictive_summary(
+        doses = para$doses, pars_mean = pars_mean, nsd = spec$nsd,
+        delta_means = d_means, delta_sds = d_sds, nsim = nsim
+      )
+      T_q <- apply(pred$samples$T, 2, quantile, probs = c(0.025, 0.975), names = FALSE)
+      E_q <- apply(pred$samples$E, 2, quantile, probs = c(0.025, 0.975), names = FALSE)
+
+      df <- tibble::tibble(
+        Scenario = scn,
+        PriorID  = pid + 1L,                    # → 2:4
+        Prior    = spec$label,
+        Dose     = para$doses,
+        T_target = pi_T,  E_target = pi_E,
+        T_mean   = colMeans(pred$samples$T),
+        T_lo     = pmax(0, T_q[1,]),  T_hi = pmin(1, T_q[2,]),
+        E_mean   = colMeans(pred$samples$E),
+        E_lo     = pmax(0, E_q[1,]),  E_hi = pmin(1, E_q[2,])
+      )
+      plot_rows[[length(plot_rows)+1]] <- df
+    } 
+    tbl <- prepare_param_table_for_scenario(scn, pars_list_by_prior,c(a0_T0,a1_T0,b0_E0,b1_E0))
+    all_rows[[length(all_rows)+1]] <- tbl
+  } 
+
+  out <- do.call(rbind, all_rows)
+  readr::write_csv(out, out_csv)
+  message("Saved parameter table to: ", out_csv)
+
+  plot_df <- dplyr::bind_rows(plot_rows) %>%
+    tidyr::pivot_longer(
+      cols = c(T_target, T_mean, T_lo, T_hi, E_target, E_mean, E_lo, E_hi),
+      names_to = c("Type","Stat"),
+      names_pattern = "([TE])_(.*)",
+      values_to = "value"
+    ) %>%
+    dplyr::mutate(Type = dplyr::recode(Type, "T"="Toxicity", "E"="Efficacy"))
+
+  invisible(list(plot_df = plot_df))
+}
+
+```
+
+
+```{r}
+library(readr)
+library(readxl)
+library(ggplot2)
+library(readr)
+library(dplyr)
+library(tidyr)
+
+file_path <- "시나리오_PKPD.csv" 
+scenario_data <- read_csv(file_path) 
+scenarios <- list() 
+for (i in seq(2, nrow(scenario_data), by = 2)) 
+{ scenario_name <- as.character(scenario_data[i, 1])
+  pi_T <- as.numeric(scenario_data[i,3:ncol(scenario_data)]) 
+  pi_E <- as.numeric(scenario_data[i+1,3:ncol(scenario_data)]) 
+  model <- scenario_data[i+2, 2] 
+  coff <- 0 #as.numeric(scenario_data[i+2, 3:ncol(scenario_data)]) 
+  scenarios[[scenario_name]] <- list(pi_T = pi_T, pi_E = pi_E) }
+para$J <- ncol(scenario_data) - 2
+para$doses <- as.numeric(scenario_data[1, 3:ncol(scenario_data)])
+
+res <- run_from_scenarios(scenarios,nsim = 200,"Test.csv")
+
+```
+
+
+```{r}
+# run_from_scenarios 실행 후
+plot_df <- res$plot_df
+
+# Prior 라벨 정규화
+plot_df$Prior <- trimws(plot_df$Prior)
+plot_df$Prior <- factor(plot_df$Prior, levels = c("Fitting", "Weakinf","Noninf","Wronginf"))
+
+# Toxicity / Efficacy 데이터 프레임
+tox_df <- plot_df %>% filter(Type=="Toxicity") %>%
+  pivot_wider(names_from = Stat, values_from = value)  # cols: target, mean, lo, hi
+eff_df <- plot_df %>% filter(Type=="Efficacy") %>%
+  pivot_wider(names_from = Stat, values_from = value)
+
+# 그림
+p <- ggplot() +
+  geom_ribbon(data = tox_df, aes(x=Dose, ymin=lo, ymax=hi), fill="#377eb8", alpha=0.20) +
+  geom_line  (data = tox_df, aes(x=Dose, y=mean),          color="#377eb8", linewidth=0.9) +
+  geom_point (data = tox_df, aes(x=Dose, y=target),        color="#377eb8", size=2.4) +
+  geom_ribbon(data = eff_df, aes(x=Dose, ymin=lo, ymax=hi), fill="#e41a1c", alpha=0.20) +
+  geom_line  (data = eff_df, aes(x=Dose, y=mean),          color="#e41a1c", linewidth=0.9) +
+  geom_point (data = eff_df, aes(x=Dose, y=target),        color="#e41a1c", size=2.4) +
+  facet_grid(rows = vars(Scenario), cols = vars(Prior),
+             scales="fixed", switch="y", drop = FALSE) +   # ★ 빈 패널도 그리기
+  labs(x="Dose", y="Probability") +
+  coord_cartesian(ylim=c(0,1)) +
+  theme_minimal(base_size=12) +
+  theme(strip.placement="outside",
+        strip.background=element_blank(),
+        panel.grid.minor=element_blank(),
+        legend.position="none")
+
+n_scn <- length(unique(plot_df$Scenario))
+ggsave("prior_vs_target_grid.png", p,
+       width = 16, height = 3.2*n_scn, dpi = 300)
+```
+
+
+
+##############################기타 Test (이전코드)############################
+# piror estiamte Test 
+```{r}
+######## Toxicity ########  
+
+f  <- function(x) 1/(1+exp(-x))
+x   <- log(50/350)
+
+# Real value
+m0 <- 0; s0 <- 10
+m1 <- 3.5; s1 <-10 
+mu <- m0+m1*x
+sigma <- sqrt(s0^2 + (x^2) * s1^2)
+
+# M = E(g[z]) Target 값 생성 
+set.seed(1)
+d <- rnorm(20000, mean = mu, sd = sigma)
+M <- mean(f(d)) 
+
+# estimate mu 계산 
+mu_est <- qlogis(M) * sqrt(1 + (pi/8)*sigma^2)
+M_est <- mean(f(rnorm(20000)*sigma + mu_est))
+
+print(M)
+print(M_est)
+
+
+######## Efficacy ########  
+
+# Real value
+a0 <-0.5; b0<-9.5 #delta0
+a1 <- 8.5; b1<-1.5 #delta1
+m0 <- 1; s0 <- 10 #b0
+m1 <- 5; s1 <-10 #b1
+mu <- m0+m1*x
+sigma <- sqrt(s0^2 + (x^2) * s1^2)
+
+# M = E(g[z]) Target 값 생성 
+set.seed(1)
+delta0 <- rbeta(20000, shape1 = a0, shape2 = b0)
+delta1 <- rbeta(20000, shape1 = a1, shape2 = b1)
+d <- rnorm(20000, mean = mu, sd = sigma)
+M <- mean(delta0 + delta1 * f(d)) 
+
+# estimate mu 계산 
+mu_est <- qlogis(((a1+b1)/a1)*(M-(a0/(a0+b0)))) * sqrt(1 + (pi/8)*sigma^2)
+d_est <- rnorm(20000, mean = mu_est, sd = sigma)
+M_est <- mean(delta0 + delta1 * f(d_est))
+
+print(M)
+print(M_est)
+```
+
+# Test 2 (모든 dose 에 대해서)
+```{r}
+
+f <- function(x) 1/(1+exp(-x))     
+ref_dose <- 350
+doses <- c(50,100,150,200,250,300,350)
+x <- log(doses/ref_dose)
+
+## 타깃값
+M_T <- c(0.001101, 0.0158 , 0.049007, 0.123613, 0.235474, 0.368298, 0.5)
+M_E <- c(0.050129, 0.054119, 0.080252, 0.163668, 0.318588, 0.49565, 0.634847)
+
+## 고정 sigma
+s0 <- 4; s1 <- 4
+sigma <- sqrt(s0^2 + (x^2)*s1^2)
+
+## efficacy용 delta (평균)
+a0 <- 0.001015203; b0 <- 0.019288848  # delta0
+a1 <- 0.017258443; b1 <- 0.003045608  # delta1
+E_d0 <- a0/(a0+b0)      # = 0.05
+E_d1 <- a1/(a1+b1)      # = 0.85
+
+## 수치 안전용
+eps <- 1e-8
+clip01 <- function(p, lo = eps, hi = 1 - eps) pmin(pmax(p, lo), hi)
+
+######## Toxicity (fit용으로만 0.05 하한 적용) ########
+M_T_fit <- pmax(M_T, 0.05)                   # <-- 여기서만 깔아줌
+mu_est_T <- qlogis(clip01(M_T_fit)) * sqrt(1 + (pi/8)*sigma^2)
+fit_T <- lm(mu_est_T ~ x)
+m0_T <- coef(fit_T)[1]
+m1_T <- coef(fit_T)[2]
+
+# 검증/재구성은 원래 타깃 M_T 기준
+set.seed(1)
+nsim <- 50000
+M_T_est <- sapply(seq_along(x), function(j){
+  z <- rnorm(nsim, mean = m0_T + m1_T*x[j], sd = sigma[j])
+  mean(f(z))
+})
+RMSE_T <- sqrt(mean( (M_T_est - M_T)^2 ))
+
+cat("### Toxicity m0,m1 추정\n")
+print(c(m0=m0_T, m1=m1_T))
+cat("\n[추정 모형으로 재구성한 M_T]\n")
+print(round(M_T_est, 3))
+cat("\n[타깃 M_T (주어진 값)]\n")
+print(round(M_T, 3))
+cat(sprintf("Toxicity 에러: %.6f\n\n", RMSE_T))
+
+######## Efficacy (fit용으로만 0.05 하한 적용) ########
+M_E_fit <- pmax(M_E, 0.02)                   # <-- 여기서만 깔아줌
+
+## E[g(Z)] 타깃으로 변환 (0~1 내부로 안전클리핑)
+M_E_star_fit <- ((a1+b1)/a1) * (M_E_fit - E_d0)  # = (1/0.85)*(M_E_fit-0.05)
+M_E_star_fit <- clip01(M_E_star_fit)
+
+mu_est_E <- qlogis(M_E_star_fit) * sqrt(1 + (pi/8)*sigma^2)
+fit_E <- lm(mu_est_E ~ x)
+m0_E <- coef(fit_E)[1]
+m1_E <- coef(fit_E)[2]
+
+## 검증/재구성은 원래 타깃 M_E 기준
+set.seed(1)
+M_E_est <- sapply(seq_along(x), function(j){
+  d0 <- rbeta(nsim, a0, b0)
+  d1 <- rbeta(nsim, a1, b1)
+  z  <- rnorm(nsim, mean = m0_E + m1_E*x[j], sd = sigma[j])
+  mean(d0 + d1 * f(z))
+})
+RMSE_E <- sqrt(mean( (M_E_est - M_E)^2 ))
+
+cat("### Efficacy m0,m1 추정\n")
+print(c(m0=m0_E, m1=m1_E))
+cat("\n[추정 모형으로 재구성한 M_E]\n")
+print(round(M_E_est, 3))
+cat("\n[타깃 M_E (주어진 값)]\n")
+print(round(M_E, 3))
+cat(sprintf("Efficacy 에러: %.6f\n\n", RMSE_E))
+
+```
+
+
+
+
+
+# Test2 그림 그리기
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+## ------------------ Toxicity: 5~95% 구간 계산 ------------------
+set.seed(123)
+nsim_band <- 100000
+tox_sims <- lapply(seq_along(x), function(j){
+  # sd_j <- sqrt(s0_T^2 + (s1_T^2) * x[j]^2)   # 표준편차
+  z <- rnorm(nsim_band, mean = m0_T + m1_T * x[j], sd = sigma[j])
+  f(z)
+})
+M_T_q05 <- sapply(tox_sims, function(v) quantile(v, 0.05))
+M_T_q95 <- sapply(tox_sims, function(v) quantile(v, 0.95))
+
+## ------------------ Efficacy: 5~95% 구간 계산 ------------------
+set.seed(123)
+eff_sims <- lapply(seq_along(x), function(j){
+  d0 <- rbeta(nsim_band, a0, b0)
+  d1 <- rbeta(nsim_band, a1, b1)
+  # sd_j <- sqrt(s0_E^2 + (s1_E^2) * x[j]^2)   # 표준편차
+  z  <- rnorm(nsim_band, mean = m0_E + m1_E*x[j], sd = sigma[j])
+  d0 + d1 * f(z)
+})
+M_E_q05 <- sapply(eff_sims, function(v) quantile(v, 0.05))
+M_E_q95 <- sapply(eff_sims, function(v) quantile(v, 0.95))
+M_E_q95 <- pmin(M_E_q95, 1)
+
+## ------------------ 표 비교 (소수점 3자리) ------------------
+tab_T <- data.frame(
+  Dose = doses,
+  Target = round(M_T, 3),
+  Estimate = round(M_T_est, 3),
+  Q05 = round(M_T_q05, 3),
+  Q95 = round(M_T_q95, 3)
+)
+tab_E <- data.frame(
+  Dose = doses,
+  Target = round(M_E, 3),
+  Estimate = round(M_E_est, 3),
+  Q05 = round(M_E_q05, 3),
+  Q95 = round(M_E_q95, 3)
+)
+
+cat("\n===== Toxicity: Target vs Estimate (with 5~95%) =====\n")
+print(tab_T, row.names = FALSE)
+cat("\n===== Efficacy: Target vs Estimate (with 5~95%) =====\n")
+print(tab_E, row.names = FALSE)
+
+## ------------------ 그림: 점(타깃), 선(추정평균), 띠(5~95%) ------------------
+df_plot <- bind_rows(
+  data.frame(
+    Dose = doses,
+    Target = M_T,
+    Mean   = M_T_est,
+    Q05    = M_T_q05,
+    Q95    = M_T_q95,
+    Type   = "Toxicity"
+  ),
+  data.frame(
+    Dose = doses,
+    Target = M_E,
+    Mean   = M_E_est,
+    Q05    = M_E_q05,
+    Q95    = M_E_q95,
+    Type   = "Efficacy"
+  )
+)
+
+# 색상 지정
+cols_line  <- c(Toxicity = "#1f77b4", Efficacy = "#d62728")   # 파랑/빨강
+cols_fill  <- c(Toxicity = "#1f77b433", Efficacy = "#d6272833") # 연한 채움(투명)
+
+p <- ggplot(df_plot, aes(x = Dose, y = Mean, color = Type, fill = Type)) +
+  # 5~95% 구간 리본
+  geom_ribbon(aes(ymin = Q05, ymax = Q95), alpha = 0.25, color = NA) +
+  # 추정 평균 선
+  geom_line(size = 1.1) +
+  # 타깃(실제 prior 평균) 점
+  geom_point(aes(y = Target), size = 2) +
+  scale_color_manual(values = cols_line) +
+  scale_fill_manual(values  = cols_fill) +
+  labs(
+    title = "Prior(점) vs Estimated Prior(선) with 5–95% Bands",
+    subtitle = "Blue=Toxicity, Red=Efficacy",
+    x = "Dose", y = "Probability"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+
+print(p)
+
+```
+
+
+
+
+```{r}
+
+## =========================================================
+## 재현 가능한 파라미터 적합 & 검증 (네 코드 그대로 함수화)
+## =========================================================
+fit_maxvar_params <- function(
+  # 필수 입력
+  f, doses, ref_dose = 350,
+  M_T, M_E,
+  a0, b0, a1, b1,
+  # 고정 상수/옵션 (원래 코드와 동일값 유지)
+  nsim = 40000,
+  target_tau = 0.95,
+  c_grid = c(1,2,5,10,20,50,100),
+  # 재현성용 시드 (원래 코드에 맞춤)
+  seed_fit_grid   = 1,  # c-grid 탐색에서 사용
+  seed_check_T    = 2,
+  seed_check_E    = 3
+){
+  ## 준비
+  x <- log(doses / ref_dose)
+  E_d0 <- a0/(a0+b0); E_d1 <- a1/(a1+b1)
+
+  ## 비율식 적합 준비
+  r_T <- qnorm(M_T)
+  ratio_model <- function(par, x){
+    a0p <- par[1]; a1p <- par[2]; b0p <- exp(par[3]); b1p <- exp(par[4])
+    (a0p + a1p * x) / sqrt(b0p^2 + (b1p^2) * x^2)
+  }
+  obj_T <- function(par){
+    r_hat <- ratio_model(par, x)
+    sum((r_T - r_hat)^2)
+  }
+  lin <- lm(r_T ~ x)
+  par0 <- c(coef(lin)[1], coef(lin)[2], log(1), log(1))
+
+  fitT <- optim(par0, obj_T, method = "BFGS")
+  alpha0 <- fitT$par[1]; alpha1 <- fitT$par[2]
+  beta0  <- exp(fitT$par[3]); beta1  <- exp(fitT$par[4])
+
+  cat("Base (alpha,beta) for Toxicity ratio:\n")
+  print(c(alpha0=alpha0, alpha1=alpha1, beta0=beta0, beta1=beta1))
+
+  ## c 선택 (Toxicity)
+  set.seed(seed_fit_grid)
+  pick_scale_T <- function(cval, M_target){
+    m0 <- cval*alpha0; m1 <- cval*alpha1
+    s0 <- cval*beta0;  s1 <- cval*beta1
+    for(j in seq_along(x)){
+      mu  <- m0 + m1*x[j]
+      sig <- sqrt(s0^2 + (s1^2)*x[j]^2)
+      z   <- rnorm(nsim, mean = mu, sd = sig)
+      gj  <- f(z)
+      mu_hat <- mean(gj)
+      var_hat <- var(gj)
+      bound   <- M_target[j]*(1 - M_target[j])
+      if (abs(mu_hat - M_target[j]) > 0.01) return(FALSE)
+      if (var_hat < target_tau * bound)      return(FALSE)
+    }
+    TRUE
+  }
+  c_star <- NA
+  for (cval in c_grid){
+    if (pick_scale_T(cval, M_T)) { c_star <- cval; break }
+  }
+  if (is.na(c_star)) c_star <- tail(c_grid,1)
+  cat(sprintf("Chosen scale c* (Toxicity): %g\n", c_star))
+
+  m0_T <- c_star*alpha0; m1_T <- c_star*alpha1
+  s0_T <- c_star*beta0;  s1_T <- c_star*beta1
+  cat("### Toxicity (a,b)~Normal params\n")
+  print(c(m0=m0_T, m1=m1_T, s0=s0_T, s1=s1_T))
+
+  ## 검증 (Toxicity)
+  set.seed(seed_check_T)
+  check_T <- sapply(seq_along(x), function(j){
+    mu  <- m0_T + m1_T*x[j]
+    sig <- sqrt(s0_T^2 + (s1_T^2)*x[j]^2)
+    z   <- rnorm(nsim, mean = mu, sd = sig)
+    gj  <- f(z)
+    c(mean=mean(gj), var=var(gj), bound = M_T[j]*(1-M_T[j]))
+  })
+  check_T <- t(check_T); colnames(check_T) <- c("mean_hat","var_hat","M*(1-M)")
+  print(round(check_T, 4))
+
+  ## Efficacy: 평균을 g로 넘기기
+  M_E_star <- (M_E - E_d0) / E_d1
+  M_E_star <- pmin(pmax(M_E_star, 1e-6), 1-1e-6)
+  r_E <- qnorm(M_E_star)
+
+  obj_E <- function(par){
+    r_hat <- ratio_model(par, x)
+    sum((r_E - r_hat)^2)
+  }
+  fitE <- optim(par0, obj_E, method = "BFGS")
+  alpha0_E <- fitE$par[1]; alpha1_E <- fitE$par[2]
+  beta0_E  <- exp(fitE$par[3]); beta1_E <- exp(fitE$par[4])
+
+  ## c 선택 (Efficacy) — 평균 유지 우선
+  c_star_E <- NA
+  for (cval in c_grid){
+    m0 <- cval*alpha0_E; m1 <- cval*alpha1_E
+    s0 <- cval*beta0_E;  s1 <- cval*beta1_E
+    OK <- TRUE
+    for(j in seq_along(x)){
+      mu  <- m0 + m1*x[j]
+      sig <- sqrt(s0^2 + (s1^2)*x[j]^2)
+      z   <- rnorm(nsim, mean = mu, sd = sig)
+      gj  <- f(z)
+      d0s <- rbeta(nsim, a0, b0)
+      d1s <- rbeta(nsim, a1, b1)
+      Y   <- d0s + d1s*gj
+      mu_hat <- mean(Y)
+      if (abs(mu_hat - M_E[j]) > 0.015) { OK <- FALSE; break }
+    }
+    if (OK) { c_star_E <- cval; break }
+  }
+  if (is.na(c_star_E)) c_star_E <- tail(c_grid,1)
+  m0_E <- c_star_E*alpha0_E; m1_E <- c_star_E*alpha1_E
+  s0_E <- c_star_E*beta0_E;  s1_E <- c_star_E*beta1_E
+  cat("### Efficacy (a,b)~Normal params\n")
+  print(c(m0=m0_E, m1=m1_E, s0=s0_E, s1=s1_E))
+
+  ## 검증 (Efficacy)
+  set.seed(seed_check_E)
+  check_E <- sapply(seq_along(x), function(j){
+    mu  <- m0_E + m1_E*x[j]
+    sig <- sqrt(s0_E^2 + (s1_E^2)*x[j]^2)
+    z   <- rnorm(nsim, mean = mu, sd = sig)
+    gj  <- f(z)
+    d0s <- rbeta(nsim, a0, b0)
+    d1s <- rbeta(nsim, a1, b1)
+    Y   <- d0s + d1s*gj
+    c(mean=mean(Y), var=var(Y))
+  })
+  check_E <- t(check_E); colnames(check_E) <- c("mean_hat","var_hat")
+  print(round(check_E, 4))
+
+  ## 결과 반환(필요한 것들 모두)
+  list(
+    x = x,
+    params_T = c(m0=m0_T, m1=m1_T, s0=s0_T, s1=s1_T, c_star=c_star),
+    params_E = c(m0=m0_E, m1=m1_E, s0=s0_E, s1=s1_E, c_star=c_star_E),
+    alpha_beta_T = c(alpha0=alpha0, alpha1=alpha1, beta0=beta0, beta1=beta1),
+    alpha_beta_E = c(alpha0=alpha0_E, alpha1=alpha1_E, beta0=beta0_E, beta1=beta1_E),
+    check_T = check_T,
+    check_E = check_E
+  )
+}
+
+## =========================================================
+## ---- 여기를 그대로 실행하면, 네 코드와 같은 출력이 납니다 ----
+## (입력은 네가 준 그대로)
+f <- function(z) 1/(1+exp(-z))
+ref_dose <- 350
+doses <- c(50,100,150,200,250,300,350)
+M_T <- c(0.001101, 0.012313, 0.049007, 0.123613, 0.235474, 0.368298, 0.5)
+M_E <- c(0.050129, 0.054119, 0.080252, 0.163668, 0.318588, 0.49565, 0.634847)
+
+a0 <- 0.05; b0 <- 0.95
+a1 <- 0.85; b1 <- 0.15
+
+res <- fit_maxvar_params(
+  f = f,
+  doses = doses, ref_dose = 350,
+  M_T = M_T, M_E = M_E,
+  a0 = a0, b0 = b0, a1 = a1, b1 = b1,
+  nsim = 40000, target_tau = 0.95,
+  c_grid = c(1,2,5,10,20,50,100),
+  seed_fit_grid = 1, seed_check_T = 2, seed_check_E = 3
+)
+
+## 최종 파라미터 개별 변수로 꺼내 쓰고 싶다면:
+m0_T <- res$params_T[["m0.(Intercept)"]]; m1_T <- res$params_T[["m1.x"]]
+s0_T <- res$params_T[["s0"]]; s1_T <- res$params_T[["s1"]]
+
+m0_E <- res$params_E[["m0.(Intercept)"]]; m1_E <- res$params_E[["m1.x"]]
+s0_E <- res$params_E[["s0"]]; s1_E <- res$params_E[["s1"]]
+
+x <- res$x
+
+
+```
+
+
+# E 직접 근사 
+```{r}
+  M_E_fit <- pmin(pmax(M_E, 0.005), 0.995)  # 너무 극단값 방지
+  eps <- 1e-8
+  
+  # 1) 초기값 (plateau → m0,m1)
+  m0_start <- max(min(M_E_fit), 1e-3)
+  m1_start <- max(min(max(M_E_fit) - m0_start, 0.999 - m0_start), 1e-3)
+  
+  # logit-approx를 이용해 선형계수 초기값
+  M_star   <- clip01((M_E_fit - m0_start) / m1_start)
+  mu_est_E <- qlogit(M_star) * lambda #z의 mean 값 E[g(z)] 로부터E[z] 계산
+  mE_lm    <- lm(mu_est_E ~ x)
+  b0_start <- unname(coef(mE_lm)[1])
+  b1_start <- unname(coef(mE_lm)[2])
+  
+  # 모델 함수
+  f_E <- function(x, m0, m1, b0, b1, lambda) {
+    m0 + m1 * plogis((b0 + b1 * x) / lambda)
+  }
+  
+  # 2) 1차 시도: nlsLM 있으면 사용, 없으면 nls
+  fitE <- NULL
+  if (isTRUE(requireNamespace("minpack.lm", quietly = TRUE))) {
+    fitE <- tryCatch(
+      minpack.lm::nlsLM(
+        M_E_fit ~ f_E(x, m0, m1, b0, b1, lambda),
+        start = list(m0 = m0_start, m1 = m1_start, b0 = b0_start, b1 = b1_start),
+        lower = c(1e-6, 1e-6, -Inf, -Inf),
+        upper = c(1 - 1e-6, 1 - 1e-6,  Inf,  Inf),
+        control = minpack.lm::nls.lm.control(maxiter = 500, ftol = 1e-10, ptol = 1e-10, gtol = 1e-10)
+      ),
+      error = function(e) NULL
+    )
+  } else {
+    fitE <- tryCatch(
+      nls(
+        M_E_fit ~ f_E(x, m0, m1, b0, b1, lambda),
+        start   = list(m0 = m0_start, m1 = m1_start, b0 = b0_start, b1 = b1_start),
+        algorithm = "port",
+        lower = c(1e-6, 1e-6, -Inf, -Inf),
+        upper = c(1 - 1e-6, 1 - 1e-6,  Inf,  Inf),
+        control = list(warnOnly = TRUE, maxiter = 200)
+      ),
+      error = function(e) NULL
+    )
+  }
+  
+  # 3) 폴백: 재매개화로 unconstrained 최적화
+  if (is.null(fitE)) {
+    # 재매개화: m0 = logistic(u), m1 = (1 - m0) * logistic(v)  => 자동 제약
+    u0 <- qlogit(clip01(m0_start))
+    v0 <- qlogit(clip01(m1_start / (1 - m0_start)))
+    p0 <- c(u0, v0, b0_start, b1_start)
+  
+    model_u <- function(par) {
+      u <- par[1]; v <- par[2]; b0 <- par[3]; b1 <- par[4]
+      m0 <- plogis(u)
+      m1 <- (1 - m0) * plogis(v)
+      f_E(x, m0, m1, b0, b1, lambda)
+    }
+    obj <- function(par) {
+      r <- M_E_fit - model_u(par)
+      sum(r * r)
+    }
+    opt <- optim(p0, obj, method = "BFGS",
+                 control = list(maxit = 1000, reltol = 1e-10))
+    u  <- opt$par[1]; v <- opt$par[2]; b0_E <- opt$par[3]; b1_E <- opt$par[4]
+    d0_E <- plogis(u)
+    d1_E <- (1 - d0_E) * plogis(v)
+  } else {
+    parsE <- coef(fitE)
+    d0_E  <- as.numeric(parsE["m0"])   # Beta mean m0
+    d1_E  <- as.numeric(parsE["m1"])   # Beta mean m1
+    b0_E  <- as.numeric(parsE["b0"])   # 선형계수
+    b1_E  <- as.numeric(parsE["b1"])
+  }
+  
+  # 4) 최종 안정화: mean만 clip, 그리고 m0 + m1 <= 1 - eps 보장
+  d0_E <- clip01(d0_E)
+  d1_E <- min(clip01(d1_E), 1 - d0_E - eps)
+  
+```
