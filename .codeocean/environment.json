@@ -1,5 +1,88 @@
 {
 	"version": 1,
 	"base_image": "registry.codeocean.com/codeocean/r-studio:r-4.5.1-1.2204.0-rstudio-server-2025.05.1-513-ubuntu22.04",
-	"options": {}
+	"post_install": true,
+	"options": {},
+	"installers": {
+		"apt": {
+			"packages": [
+				{
+					"name": "jags",
+					"version": "4.3.2-1.2204.0"
+				}
+			]
+		},
+		"rcran": {
+			"packages": [
+				{
+					"name": "rjags",
+					"version": "4-17"
+				},
+				{
+					"name": "MASS",
+					"version": "7.3-66"
+				},
+				{
+					"name": "shiny",
+					"version": "1.14.0"
+				},
+				{
+					"name": "rhandsontable",
+					"version": "0.3.8"
+				},
+				{
+					"name": "LaplacesDemon",
+					"version": "16.1.8"
+				},
+				{
+					"name": "ggplot2",
+					"version": "4.0.3"
+				},
+				{
+					"name": "readxl",
+					"version": "1.5.0.1"
+				},
+				{
+					"name": "future",
+					"version": "1.76.0"
+				},
+				{
+					"name": "doParallel",
+					"version": "1.0.17"
+				},
+				{
+					"name": "foreach",
+					"version": "1.5.2"
+				},
+				{
+					"name": "BayesLogit",
+					"version": "2.4"
+				},
+				{
+					"name": "VGAM",
+					"version": "1.1-14"
+				},
+				{
+					"name": "BOIN",
+					"version": "2.7.2"
+				},
+				{
+					"name": "UBCRM",
+					"version": "1.0.3"
+				},
+				{
+					"name": "reshape2",
+					"version": "1.4.5"
+				},
+				{
+					"name": "dplyr",
+					"version": "1.2.1"
+				},
+				{
+					"name": "readr",
+					"version": "2.2.0"
+				}
+			]
+		}
+	}
 }

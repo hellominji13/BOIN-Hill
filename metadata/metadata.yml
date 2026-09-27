@@ -1,0 +1,18 @@
+metadata_version: 1
+name: BOIN Hill
+description: |-
+  This capsule contains the source code for BOIN-Hill, a Bayesian Phase 1/2 dose-finding design developed to identify the optimal biological dose (OBD) for treatments whose efficacy may plateau before reaching the maximum tolerated dose (MTD). As part of the BOIN-Hill framework, we developed a Gibbs sampling algorithm for Bayesian inference of the bounded Hill model, enabling efficient posterior estimation of the dose-efficacy relationship.
+
+  BOIN-Hill consists of two stages. In Stage 1, dose escalation and safety monitoring are conducted using a backfill time-to-event Bayesian optimal interval (BF-TITE-BOIN) design, allowing ongoing patient follow-up and concurrent enrollment at lower dose levels. In Stage 2, toxicity and efficacy outcomes are jointly modeled to evaluate the benefit-risk profile of each dose. Toxicity and efficacy is modeled using the Hill model, with posterior inference performed using the developed Gibbs sampling algorithm.
+
+  The code provided in this capsule reproduces the simulation framework and numerical results reported in the manuscript, including data generation, dose assignment, posterior inference, OBD selection, and performance evaluation across the considered simulation scenarios.
+authors:
+- name: Minji Lee
+  affiliations:
+  - name: UNIST
+- name: Chang Hyeong Lee
+  affiliations:
+  - name: UNIST
+corresponding_contributor:
+  name: Ryung S. Kim
+  email: ryung.kim@einsteinmed.edu
