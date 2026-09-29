@@ -1,31 +1,81 @@
 # ============================================================
+# UBLRM_Paper.R
+#
+# Main simulation script for comparison of:
+#   1. 3+3
+#   2. BF_BOIN
+#   3. UBOIN
+#   4. BOIN_Hill
+#
+# Trial settings, scenarios, and prior specifications
+# are defined in config.R.
+#
+# Input files are read in config.R:
+#   ../data/시나리오_UBOIN.csv
+#   ../data/파라미터_UBOIN.csv
+#
+# Output files are written to:
+#   ../results/
+# ============================================================
+
+
+
+# ============================================================
 # 0. Packages
 # ============================================================
 
 required_packages <- c(
-  "MASS", "shiny", "rhandsontable", "LaplacesDemon",
-  "ggplot2", "readxl", "rjags", "future",
-  "doParallel", "foreach", "parallel", "BayesLogit",
-  "VGAM", "BOIN", "UBCRM", "reshape2",
-  "dplyr", "readr"
+  "MASS",
+  "shiny",
+  "rhandsontable",
+  "LaplacesDemon",
+  "ggplot2",
+  "readxl",
+  "rjags",
+  "future",
+  "doParallel",
+  "foreach",
+  "parallel",
+  "BayesLogit",
+  "VGAM",
+  "BOIN",
+  "UBCRM",
+  "reshape2",
+  "dplyr",
+  "readr",
+  "copula"
 )
 
+
 missing_packages <- required_packages[
-  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
 ]
 
+
 if (length(missing_packages) > 0) {
+
   stop(
     "Missing R packages: ",
     paste(missing_packages, collapse = ", ")
   )
 }
 
+
 suppressPackageStartupMessages(
-  invisible(lapply(required_packages, library, character.only = TRUE))
+  invisible(
+    lapply(
+      required_packages,
+      library,
+      character.only = TRUE
+    )
+  )
 )
 
-set.seed(42)
 
 
 # ============================================================
@@ -45,48 +95,68 @@ source_files <- c(
   "Stage2_Run.R"
 )
 
+
 for (file in source_files) {
-  source(file.path("Function_ver2", file))
+
+  source(
+    file.path(
+      "Function_ver2",
+      file
+    )
+  )
 }
 
 
-# ============================================================
-# 2. Trial parameters
-# ============================================================
-
-para <- list(
-  seed = 123,
-
-  J = 5,
-  S1 = 12,
-  S2 = 24,
-  N = 54,
-  cohort = 3,
-
-  window = 1,
-
-  n_cap = 12,
-  n_stop = 9,
-  N_esc = 30,
-
-  DLT = 0.25,
-  T_admissible = 0.30,
-  E_admissible = 0.20,
-
-  CT = 0.95,
-  CE = 0.90
-)
-
 
 # ============================================================
-# 3. Prior
+# 2. Load simulation configuration
 # ============================================================
 
-prior_table <- readr::read_csv(
-  "파라미터_UBOIN.csv",
-  show_col_types = FALSE
-)
+# config.R contains:
+#
+#   sim
+#     Number of simulation replicates
+#
+#   para
+#     Trial-design parameters
+#
+#   prior_table
+#     Prior specifications read from:
+#       ../data/파라미터_UBOIN.csv
+#
+#   scenarios
+#     True toxicity / efficacy scenarios read from:
+#       ../data/시나리오_UBOIN.csv
+#
+#   boin_hill_prior_ids
+#     Prior specifications evaluated for BOIN_Hill
+#     e.g. c(1, 2)
+#
+#   default_prior_id
+#     Placeholder prior used by methods that do not
+#     use the BOIN_Hill prior
+#
+source("config.R")
 
+
+# Defaults, in case these are not explicitly provided
+if (!exists("boin_hill_prior_ids")) {
+  boin_hill_prior_ids <- c(1, 2)
+}
+
+
+if (!exists("default_prior_id")) {
+  default_prior_id <- boin_hill_prior_ids[1]
+}
+
+
+set.seed(para$seed)
+
+
+
+# ============================================================
+# 3. Extract BOIN-Hill priors
+# ============================================================
 
 get_priors <- function(
   prior_table,
@@ -100,61 +170,116 @@ get_priors <- function(
     "_mean(min,a)"
   )
 
+
   sd_col <- paste0(
     "Cand",
     candidate_num,
     "_sd(max,b)"
   )
 
+
   sub_df <- dplyr::filter(
     prior_table,
     Scenario == scenario_name
   )
 
+
+  if (nrow(sub_df) == 0) {
+
+    stop(
+      "No prior specification found for scenario: ",
+      scenario_name
+    )
+  }
+
+
+  if (!(mean_col %in% names(sub_df))) {
+
+    stop(
+      "Prior column not found: ",
+      mean_col
+    )
+  }
+
+
+  if (!(sd_col %in% names(sub_df))) {
+
+    stop(
+      "Prior column not found: ",
+      sd_col
+    )
+  }
+
+
   E_prior <- list()
   T_prior <- list()
+
 
   for (i in seq_len(nrow(sub_df))) {
 
     param <- sub_df$Param[i]
-    dist <- sub_df$Dist[i]
+    dist  <- sub_df$Dist[i]
 
     mean_val <- sub_df[[mean_col]][i]
-    sd_val <- sub_df[[sd_col]][i]
+    sd_val   <- sub_df[[sd_col]][i]
 
-    # Efficacy priors
-    if (param %in% c(
-      "delta0", "delta1",
-      "b0", "b1"
-    )) {
+
+    # --------------------------------------------------------
+    # Efficacy-model priors
+    # --------------------------------------------------------
+
+    if (
+      param %in%
+        c(
+          "delta0",
+          "delta1",
+          "b0",
+          "b1"
+        )
+    ) {
 
       if (dist == "Beta") {
 
         E_prior[[paste0(param, "_a")]] <- mean_val
+
         E_prior[[paste0(param, "_b")]] <- sd_val
 
       } else if (dist == "Normal") {
 
         E_prior[[paste0(param, "_mean")]] <- mean_val
+
         E_prior[[paste0(param, "_sd")]] <- sd_val
       }
     }
 
-    # Toxicity priors
-    if (param %in% c("a0", "a1")) {
+
+    # --------------------------------------------------------
+    # Toxicity-model priors
+    # --------------------------------------------------------
+
+    if (
+      param %in%
+        c(
+          "a0",
+          "a1"
+        )
+    ) {
 
       if (dist == "Uniform") {
 
         T_prior[[paste0(param, "_min")]] <- mean_val
+
         T_prior[[paste0(param, "_max")]] <- sd_val
 
       } else if (dist == "Normal") {
 
         T_prior[[paste0(param, "_mean")]] <- mean_val
+
         T_prior[[paste0(param, "_sd")]] <- sd_val
       }
     }
   }
+
 
   list(
     E_prior = E_prior,
@@ -163,99 +288,76 @@ get_priors <- function(
 }
 
 
+
 # ============================================================
-# 4. Scenario setup
+# 4. Create results directory
 # ============================================================
 
-scenario_table <- readr::read_csv(
-  "시나리오_UBOIN.csv",
-  show_col_types = FALSE
+results_dir <- file.path(
+  "..",
+  "results"
 )
 
-score <- c(30, 100, 0, 30)
 
-scenarios <- list()
+if (!dir.exists(results_dir)) {
 
-
-for (i in seq(2, nrow(scenario_table), by = 2)) {
-
-  scenario_name <- as.character(
-    scenario_table[[1]][i]
-  )
-
-  pi_T <- as.numeric(
-    unlist(
-      scenario_table[
-        i,
-        3:ncol(scenario_table)
-      ],
-      use.names = FALSE
-    )
-  )
-
-  pi_E <- as.numeric(
-    unlist(
-      scenario_table[
-        i + 1,
-        3:ncol(scenario_table)
-      ],
-      use.names = FALSE
-    )
-  )
-
-  scenarios[[scenario_name]] <- list(
-    pi_T = pi_T,
-    pi_E = pi_E,
-    coff = 1,
-    score = score
+  dir.create(
+    results_dir,
+    recursive = TRUE
   )
 }
 
 
-# Dose information
-para$J <- ncol(scenario_table) - 2
 
-para$doses <- as.numeric(
-  unlist(
-    scenario_table[
-      1,
-      3:ncol(scenario_table)
-    ],
-    use.names = FALSE
-  )
-)
+# ============================================================
+# 5. Plot true scenarios
+# ============================================================
 
-para$ref_dose <- as.numeric(
-  scenario_table[
-    [ncol(scenario_table)]
-  ][1]
+scenario_plot_file <- file.path(
+  results_dir,
+  "scenario_plot.pdf"
 )
 
 
-# ============================================================
-# 5. Plot scenarios
-# ============================================================
+pdf(
+  scenario_plot_file,
+  width = 12,
+  height = 6
+)
 
-par(mfrow = c(2, 4))
+
+par(
+  mfrow = c(2, 4)
+)
+
 
 for (i in seq_along(scenarios)) {
 
   scenario_name <- names(scenarios)[i]
+
   scenario <- scenarios[[scenario_name]]
+
 
   prob <- calculate_joint_probabilities(
     scenario
   )
 
+
   score_prob <- t(
     apply(
       prob,
       1,
-      function(row) row * scenario$score
+      function(row) {
+        row * scenario$score
+      }
     )
   )
 
-  utility <- rowSums(score_prob)
+
+  utility <- rowSums(
+    score_prob
+  )
+
 
   plot_scenario(
     para,
@@ -267,16 +369,21 @@ for (i in seq_along(scenarios)) {
 }
 
 
-# ============================================================
-# 6. Simulation settings
-# ============================================================
+dev.off()
 
-sim <- 10
-prior_ids <- c(1, 2)
 
 
 # ============================================================
-# 7. Generate simulation data
+# 6. Generate simulation data
+# ============================================================
+#
+# A single simulated dataset is generated for each scenario
+# and shared across all methods and prior settings.
+#
+# This ensures that methods are compared using the same
+# simulated patient outcomes.
+#
+# `sim * 100` is retained from the original simulation code.
 # ============================================================
 
 generated_data <- setNames(
@@ -287,9 +394,14 @@ generated_data <- setNames(
   names(scenarios)
 )
 
-for (scenario_name in names(scenarios)) {
+
+for (
+  scenario_name
+  in names(scenarios)
+) {
 
   generated_data[[scenario_name]] <-
+
     generate_toxicity_efficacy_time(
       scenarios[[scenario_name]],
       sim * 100
@@ -297,46 +409,72 @@ for (scenario_name in names(scenarios)) {
 }
 
 
+
 # ============================================================
-# 8. Build simulation objects
+# 7. Build simulation objects
 # ============================================================
+#
+# BOIN_Hill uses two prior specifications:
+#
+#   prior 1 = strong
+#   prior 2 = weak
+#
+# The same simulation objects can also be used by
+# 3+3, BF_BOIN, and UBOIN. Those methods are run only once,
+# using default_prior_id as a placeholder because they do not
+# depend on the BOIN-Hill prior specification.
+# ============================================================
+
+prior_ids <- boin_hill_prior_ids
+
 
 sim_objects <- setNames(
   vector(
     "list",
     length(prior_ids)
   ),
-  paste0("prior", prior_ids)
+  paste0(
+    "prior",
+    prior_ids
+  )
 )
 
 
 for (p in prior_ids) {
 
-  prior_key <- paste0("prior", p)
+  prior_key <- paste0(
+    "prior",
+    p
+  )
+
 
   sim_objects[[prior_key]] <- setNames(
+
     vector(
       "list",
       length(scenarios)
     ),
+
     names(scenarios)
   )
 
-  for (scenario_name in names(scenarios)) {
+
+  for (
+    scenario_name
+    in names(scenarios)
+  ) {
 
     scenario <- scenarios[[scenario_name]]
 
+
     priors <- get_priors(
-      prior_table,
-      scenario_name,
+      prior_table = prior_table,
+      scenario_name = scenario_name,
       candidate_num = p
     )
 
-    sim_objects[
-      [prior_key]
-    ][
-      [scenario_name]
-    ] <- list(
+
+    sim_objects[[prior_key]][[scenario_name]] <- list(
 
       OBD = OBD_find(
         para,
@@ -345,24 +483,38 @@ for (p in prior_ids) {
 
       sim_num = sim,
 
-      T_prior_blrm = priors$T_prior,
+      T_prior_blrm =
+        priors$T_prior,
 
-      E_prior_blrm = priors$E_prior,
+      E_prior_blrm =
+        priors$E_prior,
 
-      scenario = scenario,
+      scenario =
+        scenario,
 
-      prior_id = p,
+      prior_id =
+        p,
 
-      data = generated_data[
-        [scenario_name]
-      ]
+      data =
+        generated_data[[scenario_name]]
     )
   }
 }
 
 
+
 # ============================================================
-# 9. Model combinations
+# 8. Methods
+# ============================================================
+#
+# Display names used in the final output:
+#
+#   3+3
+#   BF_BOIN
+#   UBOIN
+#   BOIN_Hill
+#
+# Internal function names are kept unchanged.
 # ============================================================
 
 combinations <- list(
@@ -372,56 +524,77 @@ combinations <- list(
     stage2_model = NULL
   ),
 
+
   "BF_BOIN" = list(
     stage1_model = Backfill.UBOIN.stage1,
     stage2_model = NULL
   ),
 
-  "BF_BOIN+UBOIN" = list(
+
+  "UBOIN" = list(
     stage1_model = Backfill.UBOIN.stage1,
     stage2_model = UBOIN.stage2
   ),
 
-  "BF_BOIN+UBLRM" = list(
+
+  "BOIN_Hill" = list(
     stage1_model = Backfill.UBOIN.stage1,
     stage2_model = UBLRM.stage2
   )
 )
 
 
+
 # ============================================================
-# 10. Prior label
+# 9. Prior labels
 # ============================================================
 
-get_prior_label <- function(prior_id) {
+get_prior_label <- function(
+  prior_id
+) {
 
   labels <- c(
     "1" = "strong",
-    "2" = "weak",
-    "3" = "non"
+    "2" = "weak"
   )
 
-  label <- labels[
-    as.character(prior_id)
-  ]
 
-  if (is.na(label)) {
-    label <- paste0(
-      "prior",
-      prior_id
+  prior_id_chr <- as.character(
+    prior_id
+  )
+
+
+  if (
+    prior_id_chr
+    %in%
+    names(labels)
+  ) {
+
+    return(
+      unname(
+        labels[
+          prior_id_chr
+        ]
+      )
     )
   }
 
-  label
+
+  paste0(
+    "prior",
+    prior_id
+  )
 }
 
 
+
 # ============================================================
-# 11. Run one scenario
+# 10. Run one method for one scenario
 # ============================================================
 
 process_scenario <- function(
   scenario_name,
+  combined_model_name,
   prior_id,
   sim_objects
 ) {
@@ -431,182 +604,345 @@ process_scenario <- function(
     prior_id
   )
 
-  prior_label <- get_prior_label(
-    prior_id
+
+  sim_obj <-
+    sim_objects[[prior_key]][[scenario_name]]
+
+
+  sim_data <-
+    sim_obj$data
+
+
+  # ----------------------------------------------------------
+  # Prior label
+  #
+  # BOIN_Hill:
+  #   prior 1 / prior 2 are actually compared.
+  #
+  # Other methods:
+  #   BOIN-Hill prior is not used.
+  # ----------------------------------------------------------
+
+  if (
+    combined_model_name
+    == "BOIN_Hill"
+  ) {
+
+    prior_label <-
+      get_prior_label(
+        prior_id
+      )
+
+  } else {
+
+    prior_label <-
+      "Not used"
+  }
+
+
+  # ----------------------------------------------------------
+  # Select model
+  # ----------------------------------------------------------
+
+  stage1_model <-
+    combinations[[combined_model_name]]$stage1_model
+
+
+  stage2_model <-
+    combinations[[combined_model_name]]$stage2_model
+
+
+  message(
+    "Scenario: ",
+    scenario_name,
+    " | Model: ",
+    combined_model_name,
+    " | Prior: ",
+    prior_label
   )
 
-  sim_obj <- sim_objects[
-    [prior_key]
-  ][
-    [scenario_name]
-  ]
 
-  sim_data <- sim_obj$data
+  # ----------------------------------------------------------
+  # Run simulation
+  # ----------------------------------------------------------
 
-  scenario_results <- data.frame()
+  result <- run_simulation_stage(
+    para,
+    sim_data,
+    sim_obj,
+    stage1_model,
+    stage2_model
+  )
 
+
+  # ----------------------------------------------------------
+  # Calculate operating characteristics
+  # ----------------------------------------------------------
+
+  output <- check_performance(
+    para,
+    sim_obj,
+    result
+  )
+
+
+  # ----------------------------------------------------------
+  # Store results
+  # ----------------------------------------------------------
+
+  result_row <- data.frame(
+
+    Scenario =
+      scenario_name,
+
+    Model =
+      combined_model_name,
+
+    Prior =
+      prior_label,
+
+    PCS =
+      output$PCS,
+
+    TR_mean =
+      output$TR_mean,
+
+    TR_std =
+      output$TR_std,
+
+    early_stop =
+      output$early_stop,
+
+    select_OBD_stage1 =
+      paste(
+        output$stage1_counts,
+        collapse = ", "
+      ),
+
+    select_OBD_stage2 =
+      if (
+        !is.null(
+          output$stage2_counts
+        )
+      ) {
+
+        paste(
+          output$stage2_counts,
+          collapse = ", "
+        )
+
+      } else {
+
+        "NULL"
+      },
+
+    BF_num =
+      output$BF_num,
+
+    n_stage1 =
+      output$stage1_n,
+
+    n_stage2 =
+      if (
+        !is.null(
+          output$stage2_n
+        )
+      ) {
+
+        output$stage2_n
+
+      } else {
+
+        "NULL"
+      },
+
+    TR_per_dose =
+      paste(
+        output$TR_per_dose,
+        collapse = ", "
+      ),
+
+    OBD =
+      paste(
+        sim_obj$OBD,
+        collapse = ", "
+      ),
+
+    stringsAsFactors =
+      FALSE
+  )
+
+
+  return(
+    result_row
+  )
+}
+
+
+
+# ============================================================
+# 11. Run all simulations
+# ============================================================
+#
+# For every scenario:
+#
+#   3+3
+#       run once
+#
+#   BF_BOIN
+#       run once
+#
+#   UBOIN
+#       run once
+#
+#   BOIN_Hill
+#       run with prior 1
+#       run with prior 2
+#
+# Therefore, each scenario produces five result rows.
+# ============================================================
+
+start_time <- Sys.time()
+
+
+scenario_set <- names(
+  scenarios
+)
+
+
+all_results <- data.frame()
+
+
+result_filename <- file.path(
+  results_dir,
+  paste0(
+    sim,
+    "_simulation_results.csv"
+  )
+)
+
+
+for (
+  scenario_name
+  in scenario_set
+) {
 
   for (
     combined_model_name
     in names(combinations)
   ) {
 
-    stage1_model <-
-      combinations[
-        [combined_model_name]
-      ]$stage1_model
 
-    stage2_model <-
-      combinations[
-        [combined_model_name]
-      ]$stage2_model
+    # --------------------------------------------------------
+    # Determine which prior(s) to use
+    # --------------------------------------------------------
 
+    if (
+      combined_model_name
+      == "BOIN_Hill"
+    ) {
 
-    message(
-      "Scenario: ", scenario_name,
-      " | Model: ", combined_model_name,
-      " | Prior: ", prior_label
-    )
+      # BOIN_Hill is evaluated under both priors
+      current_prior_ids <-
+        boin_hill_prior_ids
 
+    } else {
 
-    result <- run_simulation_stage(
-      para,
-      sim_data,
-      sim_obj,
-      stage1_model,
-      stage2_model
-    )
+      # Other methods do not use the BOIN-Hill prior.
+      # Use a single placeholder simulation object.
+      current_prior_ids <-
+        default_prior_id
+    }
 
 
-    output <- check_performance(
-      para,
-      sim_obj,
-      result
-    )
+    # --------------------------------------------------------
+    # Run required prior setting(s)
+    # --------------------------------------------------------
+
+    for (
+      prior_id
+      in current_prior_ids
+    ) {
+
+      result_row <-
+        process_scenario(
+
+          scenario_name =
+            scenario_name,
+
+          combined_model_name =
+            combined_model_name,
+
+          prior_id =
+            prior_id,
+
+          sim_objects =
+            sim_objects
+        )
 
 
-    result_row <- data.frame(
-
-      Scenario = scenario_name,
-
-      Model = combined_model_name,
-
-      Prior = prior_label,
-
-      PCS = output$PCS,
-
-      TR_mean = output$TR_mean,
-
-      TR_std = output$TR_std,
-
-      early_stop =
-        output$early_stop,
-
-      select_OBD_stage1 =
-        paste(
-          output$stage1_counts,
-          collapse = ", "
-        ),
-
-      select_OBD_stage2 =
-        if (!is.null(
-          output$stage2_counts
-        )) {
-          paste(
-            output$stage2_counts,
-            collapse = ", "
-          )
-        } else {
-          "NULL"
-        },
-
-      BF_num =
-        output$BF_num,
-
-      n_stage1 =
-        output$stage1_n,
-
-      n_stage2 =
-        if (!is.null(
-          output$stage2_n
-        )) {
-          output$stage2_n
-        } else {
-          "NULL"
-        },
-
-      TR_per_dose =
-        paste(
-          output$TR_per_dose,
-          collapse = ", "
-        ),
-
-      OBD =
-        paste(
-          sim_obj$OBD,
-          collapse = ", "
-        ),
-
-      stringsAsFactors = FALSE
-    )
-
-
-    scenario_results <- rbind(
-      scenario_results,
-      result_row
-    )
-  }
-
-  scenario_results
-}
-
-
-# ============================================================
-# 12. Run all simulations
-# ============================================================
-
-start_time <- Sys.time()
-
-scenario_set <- names(scenarios)
-
-all_results <- data.frame()
-
-result_filename <- paste0(
-  sim,
-  "_Test2.csv"
-)
-
-
-for (scenario_name in scenario_set) {
-
-  for (prior_id in prior_ids) {
-
-    scenario_results <-
-      process_scenario(
-        scenario_name,
-        prior_id,
-        sim_objects
+      all_results <- rbind(
+        all_results,
+        result_row
       )
 
-    all_results <- rbind(
-      all_results,
-      scenario_results
-    )
 
-    # Save progress after each run
-    write.csv(
-      all_results,
-      result_filename,
-      row.names = FALSE
-    )
+      # ------------------------------------------------------
+      # Save intermediate results after every run
+      #
+      # This is useful in Code Ocean because partial progress
+      # is preserved even if a later simulation fails.
+      # ------------------------------------------------------
+
+      write.csv(
+        all_results,
+        result_filename,
+        row.names = FALSE
+      )
+    }
   }
 }
 
+
+
+# ============================================================
+# 12. Finished
+# ============================================================
 
 end_time <- Sys.time()
 
+
+cat(
+  "\nSimulation completed.\n"
+)
+
+
+cat(
+  "Number of scenarios:",
+  length(scenarios),
+  "\n"
+)
+
+
+cat(
+  "Simulation replicates:",
+  sim,
+  "\n"
+)
+
+
+cat(
+  "Results saved to:",
+  result_filename,
+  "\n"
+)
+
+
 cat(
   "Total execution time:",
-  format(end_time - start_time),
+  format(
+    end_time -
+      start_time
+  ),
   "\n"
 )

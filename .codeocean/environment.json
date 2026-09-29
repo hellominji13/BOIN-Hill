@@ -9,6 +9,10 @@
 				{
 					"name": "jags",
 					"version": "4.3.2-1.2204.0"
+				},
+				{
+					"name": "libgsl-dev",
+					"version": "2.7.1+dfsg-3"
 				}
 			]
 		},
@@ -81,6 +85,14 @@
 				{
 					"name": "readr",
 					"version": "2.2.0"
+				},
+				{
+					"name": "copula",
+					"version": "1.1-7"
+				},
+				{
+					"name": "gsl",
+					"version": "2.1-9"
 				}
 			]
 		}
